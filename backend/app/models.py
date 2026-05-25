@@ -14,6 +14,11 @@ class ModelManager:
         self.scalers = {}
         self.encoders = {}
         self.category_maps = {}
+        # Defer loading heavy model files until needed to allow the API
+        # to start even when binary packages (like scikit-learn) are
+        # not yet installed. Models will be loaded lazily on first use.
+        self._base_path = Path(__file__).parent.parent
+        # Initialize placeholders for known tasks
         self.load_models()
 
     def _build_server_monitoring_maps(self, dataset_path):
@@ -37,50 +42,65 @@ class ModelManager:
     
     def load_models(self):
         """Load all ML models from pickle files"""
-        # Get the backend root directory path correctly
-        # __file__ = d:\Tekworks-Project-1\backend\app\models.py
-        # parent = d:\Tekworks-Project-1\backend\app
-        # parent.parent = d:\Tekworks-Project-1\backend
-        # parent.parent.parent = d:\Tekworks-Project-1
-        base_path = Path(__file__).parent.parent
-        
-        for task_key, config in TASKS_CONFIG.items():
-            try:
-                model_path = base_path / config['model_path']
-                if model_path.exists():
-                    with open(model_path, 'rb') as f:
-                        self.models[task_key] = pickle.load(f)
-                    print(f"✓ Loaded {task_key} model")
-                else:
-                    print(f"⚠ Model file not found: {model_path}")
-            except Exception as e:
-                print(f"✗ Error loading {task_key}: {str(e)}")
-            
-            # Load scaler if it exists (for task 4 - health_monitoring)
-            if 'scaler_path' in config:
-                try:
-                    scaler_path = base_path / config['scaler_path']
-                    if scaler_path.exists():
-                        with open(scaler_path, 'rb') as f:
-                            self.scalers[task_key] = pickle.load(f)
-                        print(f"✓ Loaded {task_key} scaler")
-                except Exception as e:
-                    print(f"⚠ Error loading {task_key} scaler: {str(e)}")
-            # Load encoder if provided
-            if 'encoder_path' in config:
-                try:
-                    encoder_path = base_path / config['encoder_path']
-                    if encoder_path.exists():
-                        with open(encoder_path, 'rb') as f:
-                            self.encoders[task_key] = pickle.load(f)
-                        print(f"✓ Loaded {task_key} encoder")
-                except Exception as e:
-                    print(f"⚠ Error loading {task_key} encoder: {str(e)}")
+        # Kept for backward compatibility; prefer lazy loading via
+        # `_ensure_model_loaded` which will call this for a single task.
+        for task_key in TASKS_CONFIG.keys():
+            # initialize empty placeholders; actual files are loaded lazily
+            self.models.setdefault(task_key, None)
+            self.scalers.setdefault(task_key, None)
+            self.encoders.setdefault(task_key, None)
 
-            if task_key == 'server_monitoring' and config.get('dataset_path'):
-                dataset_path = base_path / config['dataset_path']
-                if dataset_path.exists():
+    def _ensure_model_loaded(self, task_key):
+        """Load model, scaler, encoder and category maps for a specific task on demand."""
+        if self.models.get(task_key) is not None:
+            return
+
+        config = TASKS_CONFIG.get(task_key, {})
+        base_path = self._base_path
+
+        # Load model
+        model_path = config.get('model_path')
+        if model_path:
+            model_file = base_path / model_path
+            if model_file.exists():
+                try:
+                    with open(model_file, 'rb') as f:
+                        self.models[task_key] = pickle.load(f)
+                    print(f"✓ Lazily loaded {task_key} model")
+                except Exception as e:
+                    print(f"⚠ Failed to lazily load model {task_key}: {e}")
+        # Load scaler
+        scaler_path = config.get('scaler_path')
+        if scaler_path:
+            scaler_file = base_path / scaler_path
+            if scaler_file.exists():
+                try:
+                    with open(scaler_file, 'rb') as f:
+                        self.scalers[task_key] = pickle.load(f)
+                    print(f"✓ Lazily loaded {task_key} scaler")
+                except Exception as e:
+                    print(f"⚠ Failed to lazily load scaler {task_key}: {e}")
+        # Load encoder
+        encoder_path = config.get('encoder_path')
+        if encoder_path:
+            encoder_file = base_path / encoder_path
+            if encoder_file.exists():
+                try:
+                    with open(encoder_file, 'rb') as f:
+                        self.encoders[task_key] = pickle.load(f)
+                    print(f"✓ Lazily loaded {task_key} encoder")
+                except Exception as e:
+                    print(f"⚠ Failed to lazily load encoder {task_key}: {e}")
+
+        # Build server monitoring maps if applicable
+        if task_key == 'server_monitoring' and config.get('dataset_path'):
+            dataset_path = base_path / config['dataset_path']
+            if dataset_path.exists():
+                try:
                     self._build_server_monitoring_maps(dataset_path)
+                    print(f"✓ Built category maps for server_monitoring")
+                except Exception as e:
+                    print(f"⚠ Failed to build server monitoring maps: {e}")
     
     def predict(self, task_name, features_dict):
         """
@@ -99,7 +119,11 @@ class ModelManager:
         if task_name not in TASKS_CONFIG:
             raise ValueError(f"Task configuration {task_name} not found")
         
-        model = self.models[task_name]
+        # Ensure model and resources are loaded before prediction
+        self._ensure_model_loaded(task_name)
+        model = self.models.get(task_name)
+        if model is None:
+            raise ValueError(f"Model for {task_name} is not available (not loaded)")
         config = TASKS_CONFIG[task_name]
         
         try:
@@ -154,7 +178,7 @@ class ModelManager:
                         value = mapping.get(value, 0)
 
                 # If value is categorical string and an encoder exists for this task, try to transform
-                if isinstance(value, str) and task_name in self.encoders:
+                if isinstance(value, str) and self.encoders.get(task_name) is not None:
                     enc = self.encoders[task_name]
                     try:
                         # sklearn LabelEncoder or similar expects 1D array
@@ -183,7 +207,7 @@ class ModelManager:
             feature_array = np.array([feature_list])
             
             # Apply scaler if it exists (for task 4)
-            if task_name in self.scalers:
+            if self.scalers.get(task_name) is not None:
                 feature_array = self.scalers[task_name].transform(feature_array)
             
             # Make prediction
